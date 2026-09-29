@@ -88,6 +88,7 @@ def escalate_ticket(ticket_title: str, severity: str) -> str:
 safe_tools = [query_service_health, search_remediation_runbooks]
 sensitive_tools = [escalate_ticket]
 all_tools = safe_tools + sensitive_tools
+SENSITIVE_TOOL_NAMES = {t.name for t in sensitive_tools}
 
 # --- STATE & ROUTING ---
 
@@ -118,9 +119,12 @@ def call_model(state: AgentState):
 
 def route_tools(state: AgentState) -> Literal["safe_tools", "sensitive_tools", "__end__"]:
     last_message = state["messages"][-1]
-    if not getattr(last_message, "tool_calls", None):
+    tool_calls = getattr(last_message, "tool_calls", None)
+    if not tool_calls:
         return END
-    if last_message.tool_calls[0]["name"] == "escalate_ticket":
+    # Route the whole turn through the gated node if ANY call is sensitive,
+    # not just the first — a model can return multiple tool calls in one turn.
+    if any(tc["name"] in SENSITIVE_TOOL_NAMES for tc in tool_calls):
         return "sensitive_tools"
     return "safe_tools"
 
@@ -129,7 +133,7 @@ def route_tools(state: AgentState) -> Literal["safe_tools", "sensitive_tools", "
 workflow = StateGraph(AgentState)
 workflow.add_node("agent", call_model)
 workflow.add_node("safe_tools", ToolNode(safe_tools))
-workflow.add_node("sensitive_tools", ToolNode(sensitive_tools))
+workflow.add_node("sensitive_tools", ToolNode(all_tools))
 
 workflow.add_edge(START, "agent")
 workflow.add_conditional_edges(

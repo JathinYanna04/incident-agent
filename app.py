@@ -5,15 +5,44 @@ from pydantic import BaseModel
 from langchain_core.messages import HumanMessage, ToolMessage
 import gradio as gr
 
-from agent import get_agent_app
+from agent import get_agent_app, SENSITIVE_TOOL_NAMES
 
 fastapi_app = FastAPI(title="Autonomous Incident Agent API")
 agent_executor = get_agent_app()
 
 
+def pending_sensitive_calls(snapshot):
+    """All sensitive tool calls in the paused turn (a turn may bundle several calls)."""
+    last_message = snapshot.values["messages"][-1]
+    return [tc for tc in last_message.tool_calls if tc["name"] in SENSITIVE_TOOL_NAMES]
+
+
+def reject_pending_calls(config, snapshot, reason: str):
+    """Answer EVERY pending tool call in the paused turn, not just the sensitive one(s),
+    since LangGraph requires a ToolMessage per tool_call before the turn can resume."""
+    last_message = snapshot.values["messages"][-1]
+    rejection_messages = [
+        ToolMessage(
+            tool_call_id=tc["id"],
+            content=(
+                f"Rejected by engineer: {reason}"
+                if tc["name"] in SENSITIVE_TOOL_NAMES
+                else "Skipped: paused alongside a rejected sensitive action."
+            ),
+        )
+        for tc in last_message.tool_calls
+    ]
+    agent_executor.update_state(config, {"messages": rejection_messages}, as_node="sensitive_tools")
+
+
 class PromptRequest(BaseModel):
     thread_id: str
     message: str
+
+
+@fastapi_app.get("/healthz")
+async def healthz():
+    return {"status": "ok"}
 
 
 class ApprovalRequest(BaseModel):
@@ -32,12 +61,13 @@ async def chat_handler(request: PromptRequest):
     snapshot = agent_executor.get_state(config)
 
     if snapshot.next and "sensitive_tools" in snapshot.next:
-        pending_call = snapshot.values["messages"][-1].tool_calls[0]
+        pending_calls = pending_sensitive_calls(snapshot)
         return {
             "thread_id": request.thread_id,
             "status": "AWAITING_APPROVAL",
-            "pending_action": pending_call["name"],
-            "parameters": pending_call["args"],
+            "pending_actions": [
+                {"name": c["name"], "parameters": c["args"]} for c in pending_calls
+            ],
             "instruction": "Send POST to /approve to confirm or cancel this operation."
         }
 
@@ -64,12 +94,7 @@ async def approve_handler(request: ApprovalRequest):
             "response": result["messages"][-1].content
         }
     else:
-        pending_call = snapshot.values["messages"][-1].tool_calls[0]
-        rejection_msg = ToolMessage(
-            tool_call_id=pending_call["id"],
-            content=f"Rejected by engineer: {request.rejection_reason or 'No reason specified.'}"
-        )
-        agent_executor.update_state(config, {"messages": [rejection_msg]}, as_node="sensitive_tools")
+        reject_pending_calls(config, snapshot, request.rejection_reason or "No reason specified.")
         result = agent_executor.invoke(None, config=config)
         return {
             "thread_id": request.thread_id,
@@ -90,11 +115,14 @@ def run_triage(thread_id: str, message: str):
     snapshot = agent_executor.get_state(config)
 
     if snapshot.next and "sensitive_tools" in snapshot.next:
-        pending_call = snapshot.values["messages"][-1].tool_calls[0]
+        pending_calls = pending_sensitive_calls(snapshot)
+        actions_md = "\n\n".join(
+            f"- **Action:** `{c['name']}`\n"
+            f"  **Parameters:**\n```json\n{json.dumps(c['args'], indent=2)}\n```"
+            for c in pending_calls
+        )
         status_msg = (
-            f"**ACTION REQUIRED: AWAITING APPROVAL**\n\n"
-            f"- **Action:** `{pending_call['name']}`\n"
-            f"- **Parameters:**\n```json\n{json.dumps(pending_call['args'], indent=2)}\n```\n\n"
+            f"**ACTION REQUIRED: AWAITING APPROVAL**\n\n{actions_md}\n\n"
             f"*Click 'Approve' or 'Reject' below to proceed.*"
         )
         return status_msg, "AWAITING_APPROVAL"
@@ -116,12 +144,7 @@ def handle_decision(thread_id: str, decision: str, reason: str):
         result = agent_executor.invoke(None, config=config)
         return f"**Approved and executed:**\n\n{result['messages'][-1].content}", "RESOLVED"
     else:
-        pending_call = snapshot.values["messages"][-1].tool_calls[0]
-        rejection_msg = ToolMessage(
-            tool_call_id=pending_call["id"],
-            content=f"Rejected by engineer: {reason or 'Denied'}"
-        )
-        agent_executor.update_state(config, {"messages": [rejection_msg]}, as_node="sensitive_tools")
+        reject_pending_calls(config, snapshot, reason or "Denied")
         result = agent_executor.invoke(None, config=config)
         return f"**Action rejected:**\n\n{result['messages'][-1].content}", "REJECTED"
 
